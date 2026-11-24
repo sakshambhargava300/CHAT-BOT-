@@ -92,7 +92,13 @@ export default function App() {
     soundscapeRef.current = engine;
 
     const handleFirstGesture = () => {
-      void engine.unlockAndSync(settings.ambientSoundMuted, settings.ambientVolume);
+      void engine.unlockAndSync(
+        settings.ambientSoundMuted,
+        settings.ambientVolume,
+        settings.uiSoundsEnabled,
+        settings.dimensionMode,
+        settings.nostalgiaSynthEnabled
+      );
     };
 
     window.addEventListener('pointerdown', handleFirstGesture, { once: true });
@@ -109,23 +115,62 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    soundscapeRef.current?.updateSettings(settings.ambientSoundMuted, settings.ambientVolume);
-  }, [settings.ambientSoundMuted, settings.ambientVolume]);
+    soundscapeRef.current?.updateSettings(
+      settings.ambientSoundMuted,
+      settings.ambientVolume,
+      settings.uiSoundsEnabled,
+      settings.dimensionMode,
+      settings.nostalgiaSynthEnabled
+    );
+  }, [
+    settings.ambientSoundMuted,
+    settings.ambientVolume,
+    settings.uiSoundsEnabled,
+    settings.dimensionMode,
+    settings.nostalgiaSynthEnabled,
+  ]);
 
   const refreshHealth = useCallback(async () => {
-    try {
-      const resp = await fetch('/api/health');
-      if (!resp.ok) throw new Error('Health check failed');
-      const data = (await resp.json()) as ServerHealthStatus;
-      setHealth(data);
-    } catch {
-      setHealth((prev) => ({ ...prev, ok: false, checkedAt: Date.now() }));
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      try {
+        const resp = await fetch('/api/health', { cache: 'no-store' });
+        const contentType = resp.headers.get('content-type') || '';
+        if (!resp.ok || !contentType.includes('application/json')) {
+          throw new Error('Health check unavailable');
+        }
+        const data = (await resp.json()) as ServerHealthStatus;
+        setHealth(data);
+        return;
+      } catch {
+        if (attempt < 2) {
+          await new Promise((resolve) => window.setTimeout(resolve, 450 * (attempt + 1)));
+          continue;
+        }
+        setHealth((prev) => ({ ...prev, ok: false, checkedAt: Date.now() }));
+      }
     }
   }, []);
 
   useEffect(() => {
     void refreshHealth();
+    const handleFocusOrOnline = () => {
+      void refreshHealth();
+    };
+    window.addEventListener('focus', handleFocusOrOnline);
+    window.addEventListener('online', handleFocusOrOnline);
+    return () => {
+      window.removeEventListener('focus', handleFocusOrOnline);
+      window.removeEventListener('online', handleFocusOrOnline);
+    };
   }, [refreshHealth]);
+
+  useEffect(() => {
+    if (health.ok) return;
+    const retryId = window.setInterval(() => {
+      void refreshHealth();
+    }, 3000);
+    return () => window.clearInterval(retryId);
+  }, [health.ok, refreshHealth]);
 
   useEffect(() => {
     try {
@@ -248,11 +293,14 @@ export default function App() {
           throw new Error(errJson.error || `Request failed with status ${resp.status}`);
         }
 
-        if (!effective.streaming || !resp.body) {
-          const data = (await resp.json()) as {
+        setHealth((prev) => (prev.ok ? prev : { ...prev, ok: true, checkedAt: Date.now() }));
+
+        const applyUnaryResponse = async (unaryResp: globalThis.Response) => {
+          const data = (await unaryResp.json()) as {
             text?: string;
             sources?: GroundingSource[];
             usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+            model?: string;
           };
           const text = data.text ?? '';
           const fallbackUsage = data.usage ?? {
@@ -266,6 +314,10 @@ export default function App() {
           fallbackUsage.totalTokens =
             fallbackUsage.totalTokens ||
             fallbackUsage.promptTokens + fallbackUsage.completionTokens;
+          const actualModel =
+            data.model === 'gemini-3.1-flash-lite' || data.model === 'gemini-4-hydrogen'
+              ? data.model
+              : undefined;
 
           setConversations((prev) =>
             prev.map((c) =>
@@ -278,6 +330,7 @@ export default function App() {
                         ? {
                             ...m,
                             content: text,
+                            model: actualModel ?? m.model,
                             sources: data.sources ?? [],
                             usage: fallbackUsage,
                           }
@@ -288,6 +341,12 @@ export default function App() {
             )
           );
           addUsageStats(fallbackUsage);
+          void soundscapeRef.current?.playReceiveChime();
+        };
+
+        const respContentType = resp.headers.get('content-type') || '';
+        if (!effective.streaming || !resp.body || respContentType.includes('application/json')) {
+          await applyUnaryResponse(resp);
           return;
         }
 
@@ -297,88 +356,165 @@ export default function App() {
         let buffer = '';
         let currentEvent = 'message';
         let accumulatedText = '';
+        let receivedDone = false;
 
-        while (true) {
-          const { done, value } = await reader.read();
-          if (done) break;
-          buffer += decoder.decode(value, { stream: true });
+        try {
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
 
-          const lines = buffer.split('\n');
-          buffer = lines.pop() ?? '';
+            const lines = buffer.split('\n');
+            buffer = lines.pop() ?? '';
 
-          for (const rawLine of lines) {
-            if (!rawLine.trim()) {
-              currentEvent = 'message';
-              continue;
-            }
-            const parsed = parseSseLine(rawLine);
-            if (!parsed) continue;
-            if (parsed.event) {
-              currentEvent = parsed.event;
-              continue;
-            }
-            if (!parsed.data) continue;
+            for (const rawLine of lines) {
+              if (!rawLine.trim()) {
+                currentEvent = 'message';
+                continue;
+              }
+              const parsed = parseSseLine(rawLine);
+              if (!parsed) continue;
+              if (parsed.event) {
+                currentEvent = parsed.event;
+                continue;
+              }
+              if (!parsed.data) continue;
 
-            const payload = JSON.parse(parsed.data) as {
-              text?: string;
-              sources?: GroundingSource[];
-              usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
-              message?: string;
-            };
-
-            if (currentEvent === 'delta' && payload.text) {
-              accumulatedText += payload.text;
-              setConversations((prev) =>
-                prev.map((c) =>
-                  c.id === convId
-                    ? {
-                        ...c,
-                        updatedAt: Date.now(),
-                        messages: c.messages.map((m) =>
-                          m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
-                        ),
-                      }
-                    : c
-                )
-              );
-            } else if (currentEvent === 'done') {
-              const finalUsage = payload.usage ?? {
-                promptTokens: historyMessages.reduce(
-                  (acc, m) => acc + estimateTokenCount(m.content),
-                  0
-                ),
-                completionTokens: estimateTokenCount(accumulatedText),
-                totalTokens: 0,
+              let payload: {
+                text?: string;
+                sources?: GroundingSource[];
+                usage?: { promptTokens: number; completionTokens: number; totalTokens: number };
+                model?: string;
+                message?: string;
               };
-              finalUsage.totalTokens =
-                finalUsage.totalTokens ||
-                finalUsage.promptTokens + finalUsage.completionTokens;
+              try {
+                payload = JSON.parse(parsed.data) as typeof payload;
+              } catch {
+                continue;
+              }
 
-              setConversations((prev) =>
-                prev.map((c) =>
-                  c.id === convId
-                    ? {
-                        ...c,
-                        updatedAt: Date.now(),
-                        messages: c.messages.map((m) =>
-                          m.id === assistantMsgId
-                            ? {
-                                ...m,
-                                content: accumulatedText,
-                                sources: payload.sources ?? [],
-                                usage: finalUsage,
-                              }
-                            : m
-                        ),
-                      }
-                    : c
-                )
-              );
-              addUsageStats(finalUsage);
-            } else if (currentEvent === 'error') {
-              throw new Error(payload.message || 'Streaming interrupted.');
+              if (currentEvent === 'delta' && payload.text) {
+                accumulatedText += payload.text;
+                setConversations((prev) =>
+                  prev.map((c) =>
+                    c.id === convId
+                      ? {
+                          ...c,
+                          updatedAt: Date.now(),
+                          messages: c.messages.map((m) =>
+                            m.id === assistantMsgId ? { ...m, content: accumulatedText } : m
+                          ),
+                        }
+                      : c
+                  )
+                );
+              } else if (currentEvent === 'done') {
+                receivedDone = true;
+                const finalUsage = payload.usage ?? {
+                  promptTokens: historyMessages.reduce(
+                    (acc, m) => acc + estimateTokenCount(m.content),
+                    0
+                  ),
+                  completionTokens: estimateTokenCount(accumulatedText),
+                  totalTokens: 0,
+                };
+                finalUsage.totalTokens =
+                  finalUsage.totalTokens ||
+                  finalUsage.promptTokens + finalUsage.completionTokens;
+
+                const actualModel =
+                  payload.model === 'gemini-3.1-flash-lite' || payload.model === 'gemini-4-hydrogen'
+                    ? payload.model
+                    : undefined;
+
+                setConversations((prev) =>
+                  prev.map((c) =>
+                    c.id === convId
+                      ? {
+                          ...c,
+                          updatedAt: Date.now(),
+                          messages: c.messages.map((m) =>
+                            m.id === assistantMsgId
+                              ? {
+                                  ...m,
+                                  content: accumulatedText,
+                                  model: actualModel ?? m.model,
+                                  sources: payload.sources ?? [],
+                                  usage: finalUsage,
+                                }
+                              : m
+                          ),
+                        }
+                      : c
+                  )
+                );
+                addUsageStats(finalUsage);
+                void soundscapeRef.current?.playReceiveChime();
+              } else if (currentEvent === 'error') {
+                throw new Error(payload.message || 'Streaming interrupted.');
+              }
             }
           }
+        } catch (streamErr) {
+          if ((streamErr as Error).name === 'AbortError') {
+            return;
+          }
+          // If SSE failed before emitting any tokens, fall back once to unary JSON endpoint
+          if (!accumulatedText && !controller.signal.aborted) {
+            const fallbackResp = await fetch('/api/chat', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                messages: payloadMessages,
+                config: {
+                  model: effective.model,
+                  thinkingLevel: effective.thinkingLevel,
+                  maxOutputTokens: effective.maxOutputTokens,
+                  temperature: effective.temperature,
+                  topP: effective.topP,
+                  topK: effective.topK,
+                  streaming: false,
+                  webSearch: effective.webSearch,
+                  systemInstruction,
+                },
+              }),
+              signal: controller.signal,
+            });
+            if (!fallbackResp.ok) {
+              const errJson = (await fallbackResp.json().catch(() => ({}))) as { error?: string };
+              throw new Error(errJson.error || (streamErr as Error).message);
+            }
+            await applyUnaryResponse(fallbackResp);
+            return;
+          }
+          throw streamErr;
+        }
+
+        if (!receivedDone && !accumulatedText && !controller.signal.aborted) {
+          const fallbackResp = await fetch('/api/chat', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              messages: payloadMessages,
+              config: {
+                model: effective.model,
+                thinkingLevel: effective.thinkingLevel,
+                maxOutputTokens: effective.maxOutputTokens,
+                temperature: effective.temperature,
+                topP: effective.topP,
+                topK: effective.topK,
+                streaming: false,
+                webSearch: effective.webSearch,
+                systemInstruction,
+              },
+            }),
+            signal: controller.signal,
+          });
+          if (!fallbackResp.ok) {
+            const errJson = (await fallbackResp.json().catch(() => ({}))) as { error?: string };
+            throw new Error(errJson.error || 'Hawkins stream closed without data.');
+          }
+          await applyUnaryResponse(fallbackResp);
         }
       } catch (err) {
         if ((err as Error).name === 'AbortError') {
@@ -461,6 +597,7 @@ export default function App() {
       if (!customText) setPromptInput('');
       if (!customAttachments) setAttachments([]);
       setWorkspace('chat');
+      void soundscapeRef.current?.playTransmit();
 
       await streamOrFetchAssistant(
         targetConv.id,
@@ -514,7 +651,10 @@ export default function App() {
     }
   };
 
-  const handleRegenerateMessage = async (assistantMsgId: string) => {
+  const handleRegenerateMessage = async (
+    assistantMsgId: string,
+    overrideSettings?: Partial<LabSettings>
+  ) => {
     if (!activeConversation || isStreaming) return;
     const idx = activeConversation.messages.findIndex((m) => m.id === assistantMsgId);
     if (idx <= 0) return;
@@ -525,7 +665,7 @@ export default function App() {
       role: 'assistant',
       content: '',
       createdAt: Date.now(),
-      model: settings.model,
+      model: overrideSettings?.model ?? settings.model,
     };
 
     setConversations((prev) =>
@@ -539,7 +679,8 @@ export default function App() {
     await streamOrFetchAssistant(
       activeConversation.id,
       historyUpToUser,
-      replacementAssistant.id
+      replacementAssistant.id,
+      overrideSettings
     );
   };
 
@@ -627,6 +768,7 @@ export default function App() {
   return (
     <div
       data-workspace={workspace}
+      data-dimension={settings.dimensionMode}
       className="relative flex min-h-screen flex-col overflow-x-hidden bg-[#080808] text-[#EDE9E8]"
     >
       <AtmosphericBackground
@@ -634,22 +776,42 @@ export default function App() {
         reducedMotion={settings.reducedMotion}
         crtScanlines={settings.crtScanlines}
         christmasLights={settings.christmasLights}
+        dimensionMode={settings.dimensionMode}
       />
 
       <TopHeader
         workspace={workspace}
-        onNavigate={setWorkspace}
+        onNavigate={(nextWs) => {
+          void soundscapeRef.current?.playKeyClick(2);
+          setWorkspace(nextWs);
+        }}
         model={settings.model}
-        onModelChange={(model) => updateSettings({ model })}
+        onModelChange={(model) => {
+          void soundscapeRef.current?.playKeyClick(4);
+          updateSettings({ model });
+        }}
         health={health}
+        onRefreshHealth={() => void refreshHealth()}
         isBusy={isStreaming}
         ambientSoundMuted={settings.ambientSoundMuted}
         onToggleAmbientMute={() => {
           const nextMuted = !settings.ambientSoundMuted;
           updateSettings({ ambientSoundMuted: nextMuted });
-          void soundscapeRef.current?.unlockAndSync(nextMuted, settings.ambientVolume);
+          void soundscapeRef.current?.unlockAndSync(
+            nextMuted,
+            settings.ambientVolume,
+            settings.uiSoundsEnabled,
+            settings.dimensionMode,
+            settings.nostalgiaSynthEnabled
+          );
+          if (!nextMuted) {
+            void soundscapeRef.current?.playKeyClick(3);
+          }
         }}
-        onOpenSettings={() => setSettingsOpen(true)}
+        onOpenSettings={() => {
+          void soundscapeRef.current?.playKeyClick(1);
+          setSettingsOpen(true);
+        }}
         onToggleMobileSidebar={
           workspace === 'chat' ? () => setMobileSidebarOpen((v) => !v) : undefined
         }
@@ -669,6 +831,20 @@ export default function App() {
           onSubmitPrompt={() => void handleSendMessage(undefined, undefined, undefined, true)}
           onQuickAction={handleQuickAction}
           christmasLights={settings.christmasLights}
+          dimensionMode={settings.dimensionMode}
+          onChangeDimensionMode={(mode) => {
+            updateSettings({ dimensionMode: mode });
+            void soundscapeRef.current?.playGateToggle(mode === 'upside-down');
+          }}
+          onPlayBulbChime={(idx) => {
+            void soundscapeRef.current?.playBulbChime(idx);
+          }}
+          onPlayNostalgiaTheme={() => {
+            void soundscapeRef.current?.playNostalgiaTheme(3);
+          }}
+          onPlayUiClick={() => {
+            void soundscapeRef.current?.playKeyClick();
+          }}
           recentConversationsCount={conversations.length}
           onResumeLatestChat={() => {
             if (conversations[0]) setActiveConversationId(conversations[0].id);
@@ -681,12 +857,17 @@ export default function App() {
         <ChatWorkspace
           conversations={conversations}
           activeConversation={activeConversation}
-          onSelectConversation={setActiveConversationId}
+          onSelectConversation={(id) => {
+            void soundscapeRef.current?.playKeyClick();
+            setActiveConversationId(id);
+          }}
           onNewConversation={() => {
+            void soundscapeRef.current?.playKeyClick(2);
             const conv = createConversation(settings.persona, 'New Transmission');
             setActiveConversationId(conv.id);
           }}
           onDeleteConversation={(id) => {
+            void soundscapeRef.current?.playKeyClick(-2);
             setConversations((prev) => {
               const remaining = prev.filter((c) => c.id !== id);
               if (activeConversationId === id) {
@@ -700,7 +881,10 @@ export default function App() {
               prev.map((c) => (c.id === id ? { ...c, title } : c))
             );
           }}
-          onNavigateWorkspace={setWorkspace}
+          onNavigateWorkspace={(nextWs) => {
+            void soundscapeRef.current?.playKeyClick(2);
+            setWorkspace(nextWs);
+          }}
           composerValue={promptInput}
           onComposerChange={setPromptInput}
           attachments={attachments}
@@ -709,14 +893,33 @@ export default function App() {
             setAttachments((prev) => prev.filter((a) => a.id !== id))
           }
           settings={settings}
-          onToggleWebSearch={() => updateSettings({ webSearch: !settings.webSearch })}
+          onToggleWebSearch={() => {
+            void soundscapeRef.current?.playKeyClick(1);
+            updateSettings({ webSearch: !settings.webSearch });
+          }}
           onSendMessage={() => void handleSendMessage()}
           onStopStreaming={() => {
+            void soundscapeRef.current?.playKeyClick(-3);
             chatAbortRef.current?.abort();
             setIsStreaming(false);
           }}
-          onRegenerateMessage={(id) => void handleRegenerateMessage(id)}
-          onEditUserMessage={(id, next) => void handleEditUserMessage(id, next)}
+          onRegenerateMessage={(id) => {
+            void soundscapeRef.current?.playTransmit();
+            void handleRegenerateMessage(id);
+          }}
+          onRetryWithoutWebSearch={(id) => {
+            void soundscapeRef.current?.playTransmit();
+            updateSettings({ webSearch: false });
+            void handleRegenerateMessage(id, { webSearch: false });
+          }}
+          onEditUserMessage={(id, next) => {
+            void soundscapeRef.current?.playTransmit();
+            void handleEditUserMessage(id, next);
+          }}
+          onQuickFollowUp={(followUp) => void handleSendMessage(followUp)}
+          onPlayUiClick={() => {
+            void soundscapeRef.current?.playKeyClick();
+          }}
           isStreaming={isStreaming}
           tokenStats={tokenStats}
           mobileSidebarOpen={mobileSidebarOpen}
@@ -748,6 +951,9 @@ export default function App() {
         activeContextTokens={activeContextTokens}
         health={health}
         onRefreshHealth={() => void refreshHealth()}
+        onPlayNostalgiaTheme={() => {
+          void soundscapeRef.current?.playNostalgiaTheme(2);
+        }}
       />
     </div>
   );

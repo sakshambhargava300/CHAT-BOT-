@@ -6,6 +6,7 @@ interface AtmosphericBackgroundProps {
   reducedMotion: boolean;
   crtScanlines: boolean;
   christmasLights: boolean;
+  dimensionMode: 'hawkins' | 'upside-down';
 }
 
 interface Spore {
@@ -46,9 +47,16 @@ export function AtmosphericBackground({
   reducedMotion,
   crtScanlines,
   christmasLights,
+  dimensionMode,
 }: AtmosphericBackgroundProps) {
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const pointerRef = useRef<{ x: number; y: number; active: boolean }>({
+    x: -9999,
+    y: -9999,
+    active: false,
+  });
   const backdrop = BACKDROP_BY_WORKSPACE[workspace];
+  const isUpsideDown = dimensionMode === 'upside-down';
 
   useEffect(() => {
     const canvas = canvasRef.current;
@@ -69,17 +77,27 @@ export function AtmosphericBackground({
       width = canvas.width = window.innerWidth;
       height = canvas.height = window.innerHeight;
     };
-    window.addEventListener('resize', handleResize);
 
-    const count = prefersReduced ? 26 : 52;
+    const handlePointerMove = (e: PointerEvent) => {
+      pointerRef.current = { x: e.clientX, y: e.clientY, active: true };
+    };
+    const handlePointerLeave = () => {
+      pointerRef.current.active = false;
+    };
+
+    window.addEventListener('resize', handleResize);
+    window.addEventListener('pointermove', handlePointerMove, { passive: true });
+    window.addEventListener('pointerleave', handlePointerLeave);
+
+    const count = prefersReduced ? 26 : isUpsideDown ? 72 : 52;
     const spores: Spore[] = Array.from({ length: count }, (_, i) => ({
       x: Math.random() * width,
       y: Math.random() * height,
-      r: 0.9 + Math.random() * 2.1,
+      r: 0.9 + Math.random() * (isUpsideDown ? 2.5 : 2.1),
       vx: (Math.random() - 0.5) * 0.28,
-      vy: -0.15 - Math.random() * 0.35,
-      alpha: 0.16 + Math.random() * 0.42,
-      isRed: i % 5 === 0,
+      vy: isUpsideDown ? 0.14 + Math.random() * 0.36 : -0.15 - Math.random() * 0.35,
+      alpha: 0.18 + Math.random() * 0.44,
+      isRed: isUpsideDown ? i % 7 === 0 : i % 5 === 0,
     }));
 
     const drawFrame = () => {
@@ -89,7 +107,9 @@ export function AtmosphericBackground({
         ctx.arc(s.x, s.y, s.r, 0, Math.PI * 2);
         ctx.fillStyle = s.isRed
           ? `rgba(229, 9, 20, ${s.alpha * 0.85})`
-          : `rgba(186, 204, 224, ${s.alpha * 0.65})`;
+          : isUpsideDown
+            ? `rgba(147, 197, 253, ${s.alpha * 0.72})`
+            : `rgba(186, 204, 224, ${s.alpha * 0.65})`;
         ctx.fill();
       }
     };
@@ -98,6 +118,8 @@ export function AtmosphericBackground({
       drawFrame();
       return () => {
         window.removeEventListener('resize', handleResize);
+        window.removeEventListener('pointermove', handlePointerMove);
+        window.removeEventListener('pointerleave', handlePointerLeave);
       };
     }
 
@@ -108,11 +130,29 @@ export function AtmosphericBackground({
       if (document.hidden || now - lastDraw < 48) return;
       lastDraw = now;
 
+      const ptr = pointerRef.current;
       for (const s of spores) {
-        s.x += s.vx + Math.sin(s.y * 0.01) * 0.12;
-        s.y += s.vy;
+        let dxPush = 0;
+        let dyPush = 0;
+        if (ptr.active) {
+          const dx = s.x - ptr.x;
+          const dy = s.y - ptr.y;
+          const distSq = dx * dx + dy * dy;
+          if (distSq > 4 && distSq < 18000) {
+            const dist = Math.sqrt(distSq);
+            const force = ((135 - dist) / 135) * 0.9;
+            dxPush = (dx / dist) * force;
+            dyPush = (dy / dist) * force;
+          }
+        }
+
+        s.x += s.vx + Math.sin(s.y * 0.01) * 0.14 + dxPush;
+        s.y += s.vy + dyPush;
         if (s.y < -10) {
           s.y = height + 10;
+          s.x = Math.random() * width;
+        } else if (s.y > height + 10) {
+          s.y = -10;
           s.x = Math.random() * width;
         }
         if (s.x < -10) s.x = width + 10;
@@ -126,8 +166,10 @@ export function AtmosphericBackground({
     return () => {
       window.cancelAnimationFrame(rafId);
       window.removeEventListener('resize', handleResize);
+      window.removeEventListener('pointermove', handlePointerMove);
+      window.removeEventListener('pointerleave', handlePointerLeave);
     };
-  }, [reducedMotion]);
+  }, [reducedMotion, isUpsideDown]);
 
   return (
     <div
@@ -139,7 +181,9 @@ export function AtmosphericBackground({
         src={backdrop.src}
         alt={backdrop.alt}
         referrerPolicy="no-referrer"
-        className={`h-full w-full object-cover object-center transition-opacity duration-700 ${backdrop.opacityClass}`}
+        className={`h-full w-full object-cover object-center transition-opacity duration-500 ${
+          isUpsideDown ? 'opacity-28' : backdrop.opacityClass
+        }`}
         onError={(e) => {
           (e.currentTarget as HTMLImageElement).style.display = 'none';
         }}
@@ -147,10 +191,11 @@ export function AtmosphericBackground({
 
       {/* Contrast & vignette scrim (keeps text > 4.5:1) */}
       <div
-        className="absolute inset-0"
+        className="absolute inset-0 transition-colors duration-500"
         style={{
-          background:
-            'radial-gradient(circle at 50% 35%, rgba(36, 10, 13, 0.42) 0%, rgba(8, 8, 8, 0.86) 62%, rgba(8, 8, 8, 0.98) 100%)',
+          background: isUpsideDown
+            ? 'radial-gradient(circle at 50% 35%, rgba(29, 78, 216, 0.28) 0%, rgba(10, 18, 36, 0.84) 55%, rgba(6, 9, 16, 0.97) 100%)'
+            : 'radial-gradient(circle at 50% 35%, rgba(36, 10, 13, 0.42) 0%, rgba(8, 8, 8, 0.86) 62%, rgba(8, 8, 8, 0.98) 100%)',
         }}
       />
 
@@ -158,8 +203,9 @@ export function AtmosphericBackground({
       <div
         className="animate-hawkins-fog absolute -inset-16"
         style={{
-          background:
-            'radial-gradient(ellipse at 25% 65%, rgba(29, 53, 87, 0.18) 0%, transparent 52%), radial-gradient(ellipse at 75% 30%, rgba(229, 9, 20, 0.14) 0%, transparent 48%)',
+          background: isUpsideDown
+            ? 'radial-gradient(ellipse at 25% 65%, rgba(96, 165, 250, 0.22) 0%, transparent 52%), radial-gradient(ellipse at 75% 30%, rgba(229, 9, 20, 0.16) 0%, transparent 48%)'
+            : 'radial-gradient(ellipse at 25% 65%, rgba(29, 53, 87, 0.18) 0%, transparent 52%), radial-gradient(ellipse at 75% 30%, rgba(229, 9, 20, 0.14) 0%, transparent 48%)',
         }}
       />
 

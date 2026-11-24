@@ -72,6 +72,9 @@ export interface LabSettings {
   christmasLights: boolean;
   ambientSoundMuted: boolean;
   ambientVolume: number;
+  uiSoundsEnabled: boolean;
+  nostalgiaSynthEnabled: boolean;
+  dimensionMode: 'hawkins' | 'upside-down';
   persona: PersonaPreset;
   ttsVoice: 'Charon' | 'Kore' | 'Fenrir' | 'Puck' | 'Zephyr';
 }

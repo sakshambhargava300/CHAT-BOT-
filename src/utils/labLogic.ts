@@ -61,6 +61,9 @@ export const DEFAULT_LAB_SETTINGS: LabSettings = {
   christmasLights: true,
   ambientSoundMuted: false,
   ambientVolume: 0.45,
+  uiSoundsEnabled: true,
+  nostalgiaSynthEnabled: true,
+  dimensionMode: 'hawkins',
   persona: 'hawkins',
   ttsVoice: 'Charon',
 };
@@ -73,6 +76,57 @@ export const DEFAULT_TOKEN_STATS: TokenUsageStats = {
 };
 
 export const ALPHABET_WALL_LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+
+// C minor / Stranger Things iconic arpeggio intervals (Hz) across 26 bulbs
+const HAWKINS_ARP_SCALE = [
+  130.81, 155.56, 196.0, 246.94, 261.63, 311.13, 392.0, 493.88, 523.25,
+];
+
+export const NOSTALGIA_ARP_STEP_MS = 172;
+
+export interface NostalgiaArpNote {
+  letter: 'C' | 'E' | 'G' | 'B';
+  letterIndex: number;
+  freq: number;
+}
+
+// Iconic 1980s analog synth 8-step up-and-down Cmaj7 ostinato (C3-E3-G3-B3-C4-B3-G3-E3)
+export const NOSTALGIA_ARP_NOTES: NostalgiaArpNote[] = [
+  { letter: 'C', letterIndex: 2, freq: 130.81 },
+  { letter: 'E', letterIndex: 4, freq: 164.81 },
+  { letter: 'G', letterIndex: 6, freq: 196.0 },
+  { letter: 'B', letterIndex: 1, freq: 246.94 },
+  { letter: 'C', letterIndex: 2, freq: 261.63 },
+  { letter: 'B', letterIndex: 1, freq: 246.94 },
+  { letter: 'G', letterIndex: 6, freq: 196.0 },
+  { letter: 'E', letterIndex: 4, freq: 164.81 },
+];
+
+export interface TimedArpStep extends NostalgiaArpNote {
+  stepIndex: number;
+  delayMs: number;
+}
+
+export function getNostalgiaArpPattern(cycles = 3): TimedArpStep[] {
+  const safeCycles = Math.max(1, Math.min(8, Math.floor(cycles)));
+  const steps: TimedArpStep[] = [];
+  for (let c = 0; c < safeCycles; c += 1) {
+    for (let i = 0; i < NOSTALGIA_ARP_NOTES.length; i += 1) {
+      const stepIndex = c * NOSTALGIA_ARP_NOTES.length + i;
+      steps.push({
+        ...NOSTALGIA_ARP_NOTES[i],
+        stepIndex,
+        delayMs: stepIndex * NOSTALGIA_ARP_STEP_MS,
+      });
+    }
+  }
+  return steps;
+}
+
+export function getSynthFrequencyForLetter(index: number): number {
+  const safeIdx = Math.abs(Math.floor(index)) % HAWKINS_ARP_SCALE.length;
+  return HAWKINS_ARP_SCALE[safeIdx];
+}
 
 export function isSamplingSupported(modelId: ModelId): boolean {
   return MODEL_CATALOG[modelId]?.supportsSamplingParams ?? false;
@@ -92,11 +146,13 @@ export function sanitizeLabSettings(input: Partial<LabSettings>): LabSettings {
   const model: ModelId =
     input.model && input.model in MODEL_CATALOG ? input.model : DEFAULT_LAB_SETTINGS.model;
   const meta = MODEL_CATALOG[model];
+  const dimensionMode = input.dimensionMode === 'upside-down' ? 'upside-down' : 'hawkins';
 
   return {
     ...DEFAULT_LAB_SETTINGS,
     ...input,
     model,
+    dimensionMode,
     maxOutputTokens: Math.round(
       clampNumber(
         input.maxOutputTokens ?? DEFAULT_LAB_SETTINGS.maxOutputTokens,

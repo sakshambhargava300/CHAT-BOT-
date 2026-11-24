@@ -48,7 +48,10 @@ interface ChatWorkspaceProps {
   onSendMessage: () => void;
   onStopStreaming: () => void;
   onRegenerateMessage: (assistantMsgId: string) => void;
+  onRetryWithoutWebSearch?: (assistantMsgId: string) => void;
   onEditUserMessage: (userMsgId: string, newContent: string) => void;
+  onQuickFollowUp: (prompt: string) => void;
+  onPlayUiClick: () => void;
   isStreaming: boolean;
   tokenStats: TokenUsageStats;
   mobileSidebarOpen: boolean;
@@ -73,7 +76,10 @@ export function ChatWorkspace({
   onSendMessage,
   onStopStreaming,
   onRegenerateMessage,
+  onRetryWithoutWebSearch,
   onEditUserMessage,
+  onQuickFollowUp,
+  onPlayUiClick,
   isStreaming,
   tokenStats,
   mobileSidebarOpen,
@@ -514,9 +520,18 @@ export function ChatWorkspace({
                     ) : msg.error ? (
                       <div
                         role="alert"
-                        className="rounded-lg border border-[#E50914]/50 bg-[#240A0D] p-3 text-sm text-[#FF9CA2]"
+                        className="space-y-2.5 rounded-lg border border-[#E50914]/50 bg-[#240A0D] p-3 text-sm text-[#FF9CA2]"
                       >
-                        {msg.error}
+                        <p>{msg.error}</p>
+                        {settings.webSearch && onRetryWithoutWebSearch && !isStreaming && (
+                          <button
+                            type="button"
+                            onClick={() => onRetryWithoutWebSearch(msg.id)}
+                            className="font-hawkins-mono inline-flex items-center rounded border border-[#E50914]/60 bg-[#3A1016] px-2.5 py-1 text-xs font-medium text-white transition-colors hover:bg-[#E50914]"
+                          >
+                            Retry without Web Search
+                          </button>
+                        )}
                       </div>
                     ) : isUser ? (
                       <p className="text-[15px] leading-7 whitespace-pre-wrap text-zinc-100">
@@ -634,6 +649,29 @@ export function ChatWorkspace({
                             {msg.usage.totalTokens.toLocaleString()} tokens
                           </span>
                         )}
+                      </div>
+                    )}
+
+                    {/* Interactive Follow-Up Prompts on latest completed AI response */}
+                    {isLastAssistant && !isStreaming && msg.content && !msg.error && (
+                      <div className="mt-3 flex flex-wrap items-center gap-1.5">
+                        {[
+                          { label: 'Dig deeper', prompt: 'Elaborate further on the key technical details above.' },
+                          { label: 'Summarize concisely', prompt: 'Summarize the response above in 3 crisp bullet points.' },
+                          { label: 'Give a code example', prompt: 'Provide a practical TypeScript or Python code example illustrating this.' },
+                        ].map((chip) => (
+                          <button
+                            key={chip.label}
+                            type="button"
+                            onClick={() => {
+                              onPlayUiClick();
+                              onQuickFollowUp(chip.prompt);
+                            }}
+                            className="font-hawkins-mono rounded-md border border-white/10 bg-[#190F12] px-2.5 py-1 text-[11px] text-zinc-300 transition-colors hover:border-[#E50914]/60 hover:text-white"
+                          >
+                            {chip.label}
+                          </button>
+                        ))}
                       </div>
                     )}
                   </article>

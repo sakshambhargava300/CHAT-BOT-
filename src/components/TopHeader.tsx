@@ -8,6 +8,7 @@ interface TopHeaderProps {
   model: ModelId;
   onModelChange: (model: ModelId) => void;
   health: ServerHealthStatus;
+  onRefreshHealth?: () => void;
   isBusy: boolean;
   ambientSoundMuted: boolean;
   onToggleAmbientMute: () => void;
@@ -21,6 +22,7 @@ export function TopHeader({
   model,
   onModelChange,
   health,
+  onRefreshHealth,
   isBusy,
   ambientSoundMuted,
   onToggleAmbientMute,
@@ -104,15 +106,18 @@ export function TopHeader({
 
       {/* Zone 3: System Status, Model Selector, Ambient Audio Toggle, Settings */}
       <div className="flex shrink-0 items-center gap-2 sm:gap-2.5">
-        <div
-          className="hidden items-center gap-2 border-r border-white/10 pr-3 sm:flex"
-          title={`Provider: ${health.provider}`}
+        <button
+          type="button"
+          onClick={onRefreshHealth}
+          className="hidden items-center gap-2 rounded px-1.5 py-1 border-r border-white/10 pr-3 transition-opacity hover:opacity-85 focus:outline-none focus-visible:ring-1 focus-visible:ring-[#E50914] sm:flex"
+          title={`Provider: ${health.provider} — Click to re-verify signal`}
+          aria-label={`System status: ${statusText}. Click to verify signal`}
         >
           <Radio className={`h-3.5 w-3.5 ${statusTone}`} aria-hidden="true" />
           <span className={`font-hawkins-mono text-xs whitespace-nowrap ${statusTone}`}>
             {statusText}
           </span>
-        </div>
+        </button>
 
         <label className="sr-only" htmlFor="header-model-select">
           Select AI Model

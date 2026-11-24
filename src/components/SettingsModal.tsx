@@ -19,6 +19,7 @@ interface SettingsModalProps {
   activeContextTokens: number;
   health: ServerHealthStatus;
   onRefreshHealth: () => void;
+  onPlayNostalgiaTheme: () => void;
 }
 
 export function SettingsModal({
@@ -31,6 +32,7 @@ export function SettingsModal({
   activeContextTokens,
   health,
   onRefreshHealth,
+  onPlayNostalgiaTheme,
 }: SettingsModalProps) {
   if (!open) return null;
 
@@ -455,6 +457,16 @@ export function SettingsModal({
                   label: 'Mute Upside Down Soundscape',
                   desc: 'Silence ambient rumbles, crackling, and distant echoes',
                 },
+                {
+                  key: 'uiSoundsEnabled' as const,
+                  label: 'Hawkins UI Sound Effects',
+                  desc: 'Tactile terminal clicks, synth wall chimes, and gate tones',
+                },
+                {
+                  key: 'nostalgiaSynthEnabled' as const,
+                  label: 'Nostalgic 80s Synth Theme',
+                  desc: 'Analog Cmaj7 shimmer swells in ambient soundscape',
+                },
               ].map((toggle) => {
                 const checked = settings[toggle.key];
                 return (
@@ -478,16 +490,26 @@ export function SettingsModal({
                 );
               })}
 
-              <div className="rounded-lg border border-white/10 bg-[#120D10] p-3">
-                <div className="flex items-center justify-between">
+              <div className="rounded-lg border border-white/10 bg-[#120D10] p-3 sm:col-span-2">
+                <div className="flex flex-wrap items-center justify-between gap-2">
                   <label htmlFor="slider-ambient-volume" className="text-xs font-medium text-zinc-100">
-                    Ambient Soundscape Level
+                    Ambient Soundscape & Synth Level
                   </label>
-                  <span className="font-hawkins-mono text-xs text-zinc-300">
-                    {settings.ambientSoundMuted
-                      ? 'Muted'
-                      : `${Math.round(settings.ambientVolume * 100)}%`}
-                  </span>
+                  <div className="flex items-center gap-2.5">
+                    <button
+                      type="button"
+                      disabled={settings.ambientSoundMuted}
+                      onClick={onPlayNostalgiaTheme}
+                      className="font-hawkins-mono rounded border border-[#E50914]/45 bg-[#240A0D] px-2.5 py-0.5 text-[11px] text-[#FF8A91] transition-colors hover:border-[#E50914] hover:text-white disabled:opacity-40"
+                    >
+                      Preview 80s Synth
+                    </button>
+                    <span className="font-hawkins-mono text-xs text-zinc-300">
+                      {settings.ambientSoundMuted
+                        ? 'Muted'
+                        : `${Math.round(settings.ambientVolume * 100)}%`}
+                    </span>
+                  </div>
                 </div>
                 <input
                   id="slider-ambient-volume"

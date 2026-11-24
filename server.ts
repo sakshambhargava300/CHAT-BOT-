@@ -9,7 +9,17 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const IS_PROD = process.env.NODE_ENV === 'production';
+const DIST_DIR = path.resolve(__dirname, 'dist');
+const DIST_INDEX = path.join(DIST_DIR, 'index.html');
+const RUNNING_UNDER_TSX =
+  process.execArgv.some((arg) => arg.includes('tsx')) ||
+  process.argv.some((arg) => arg.includes('tsx')) ||
+  process.env.npm_lifecycle_event === 'dev';
+const IS_PROD =
+  process.env.NODE_ENV === 'production' ||
+  process.env.npm_lifecycle_event === 'start' ||
+  Boolean(process.env.K_SERVICE || process.env.K_REVISION) ||
+  (!RUNNING_UNDER_TSX && fs.existsSync(DIST_INDEX));
 
 type AllowedModel = 'gemini-4-hydrogen' | 'gemini-3.1-flash-lite';
 
@@ -44,15 +54,21 @@ interface ExtractedSource {
   snippet?: string;
 }
 
-function createAiClient(): GoogleGenAI {
-  const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey) {
+function isApiKeyConfigured(): boolean {
+  const key = process.env.GEMINI_API_KEY?.trim() ?? '';
+  return Boolean(key && key !== 'MY_GEMINI_API_KEY');
+}
+
+function createAiClient(apiVersion?: string): GoogleGenAI {
+  const apiKey = process.env.GEMINI_API_KEY?.trim();
+  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     throw new Error(
       'GEMINI_API_KEY is not configured on the server. Add it in Settings > Secrets.'
     );
   }
   return new GoogleGenAI({
     apiKey,
+    ...(apiVersion ? { apiVersion } : {}),
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -204,13 +220,30 @@ function isTransientError(err: unknown): boolean {
   return (
     raw.includes('503') ||
     raw.includes('UNAVAILABLE') ||
+    raw.includes('429') ||
+    raw.includes('RESOURCE_EXHAUSTED') ||
     raw.includes('ECONNRESET') ||
     raw.includes('ETIMEDOUT') ||
+    raw.includes('MODEL_TIMEOUT') ||
     raw.includes('500')
   );
 }
 
-async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('MODEL_TIMEOUT: upstream call exceeded deadline')), ms);
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+async function withRetry<T>(fn: () => Promise<T>, maxRetries = 1): Promise<T> {
   let lastErr: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
@@ -218,7 +251,7 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
     } catch (err) {
       lastErr = err;
       if (attempt < maxRetries && isTransientError(err)) {
-        const delayMs = 800 * Math.pow(2, attempt);
+        const delayMs = 450 * Math.pow(2, attempt);
         await new Promise((resolve) => setTimeout(resolve, delayMs));
         continue;
       }
@@ -226,6 +259,25 @@ async function withRetry<T>(fn: () => Promise<T>, maxRetries = 2): Promise<T> {
     }
   }
   throw lastErr;
+}
+
+async function withModelFailover<T>(
+  preferredModel: AllowedModel,
+  run: (model: AllowedModel) => Promise<T>
+): Promise<{ result: T; modelUsed: AllowedModel }> {
+  try {
+    const result = await withRetry(() => withTimeout(run(preferredModel), 15000), 1);
+    return { result, modelUsed: preferredModel };
+  } catch (err) {
+    if (preferredModel !== 'gemini-3.1-flash-lite' && isTransientError(err)) {
+      const fallbackResult = await withRetry(
+        () => withTimeout(run('gemini-3.1-flash-lite'), 25000),
+        1
+      );
+      return { result: fallbackResult, modelUsed: 'gemini-3.1-flash-lite' };
+    }
+    throw err;
+  }
 }
 
 function formatErrorResponse(err: unknown): { status: number; message: string } {
@@ -294,9 +346,10 @@ async function startServer(): Promise<void> {
   app.use(express.urlencoded({ extended: true, limit: '25mb' }));
 
   app.get('/api/health', (_req: Request, res: Response) => {
+    res.setHeader('Cache-Control', 'no-store, max-age=0');
     res.json({
       ok: true,
-      apiKeyConfigured: Boolean(process.env.GEMINI_API_KEY),
+      apiKeyConfigured: isApiKeyConfigured(),
       provider: 'Google Gemini (Hawkins Lab Proxy)',
       endpoint: '/api/chat',
       checkedAt: Date.now(),
@@ -316,8 +369,7 @@ async function startServer(): Promise<void> {
     }
 
     const cfg = body?.config ?? {};
-    const model = resolveModel(cfg.model);
-    const modelConfig = buildModelConfig(model, cfg);
+    const requestedModel = resolveModel(cfg.model);
     const shouldStream = cfg.streaming !== false;
 
     const contents = messages.map((m) => ({
@@ -329,12 +381,14 @@ async function startServer(): Promise<void> {
       const ai = createAiClient();
 
       if (!shouldStream) {
-        const response = await withRetry(() =>
-          ai.models.generateContent({
-            model,
-            contents,
-            config: modelConfig,
-          })
+        const { result: response, modelUsed } = await withModelFailover(
+          requestedModel,
+          (activeModel) =>
+            ai.models.generateContent({
+              model: activeModel,
+              contents,
+              config: buildModelConfig(activeModel, cfg),
+            })
         );
         const sources = extractGroundingSources(response);
         const usage = extractUsage(response);
@@ -342,7 +396,7 @@ async function startServer(): Promise<void> {
           text: response.text ?? '',
           sources,
           usage,
-          model,
+          model: modelUsed,
         });
         return;
       }
@@ -350,60 +404,106 @@ async function startServer(): Promise<void> {
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
+      res.setHeader('X-Accel-Buffering', 'no');
       res.flushHeaders();
+      res.write(': stream-open\n\n');
 
       let closed = false;
+      const keepAliveTimer = setInterval(() => {
+        if (!closed && !res.writableEnded) {
+          res.write(': keep-alive\n\n');
+        }
+      }, 4000);
       res.on('close', () => {
         closed = true;
+        clearInterval(keepAliveTimer);
       });
 
-      const stream = await withRetry(() =>
-        ai.models.generateContentStream({
-          model,
-          contents,
-          config: modelConfig,
-        })
-      );
+      const runChatStream = async (activeModel: AllowedModel) => {
+        const stream = await withTimeout(
+          ai.models.generateContentStream({
+            model: activeModel,
+            contents,
+            config: buildModelConfig(activeModel, cfg),
+          }),
+          18000
+        );
 
-      const collectedSources = new Map<string, ExtractedSource>();
-      let finalUsage: {
-        promptTokens: number;
-        completionTokens: number;
-        totalTokens: number;
-      } | null = null;
+        const collectedSources = new Map<string, ExtractedSource>();
+        let finalUsage: {
+          promptTokens: number;
+          completionTokens: number;
+          totalTokens: number;
+        } | null = null;
+        let emittedDelta = false;
 
-      for await (const chunk of stream) {
-        if (closed) break;
-        const delta = chunk.text ?? '';
-        if (delta) {
-          writeSseEvent(res, 'delta', { text: delta });
+        try {
+          for await (const chunk of stream) {
+            if (closed) break;
+            const delta = chunk.text ?? '';
+            if (delta) {
+              emittedDelta = true;
+              writeSseEvent(res, 'delta', { text: delta });
+            }
+            for (const src of extractGroundingSources(chunk)) {
+              if (!collectedSources.has(src.url)) {
+                collectedSources.set(src.url, src);
+              }
+            }
+            const chunkUsage = extractUsage(chunk);
+            if (chunkUsage) {
+              finalUsage = chunkUsage;
+            }
+          }
+          if (!emittedDelta && !closed) {
+            throw new Error('503 UNAVAILABLE empty chat stream');
+          }
+        } catch (streamErr) {
+          if (!emittedDelta && activeModel !== 'gemini-3.1-flash-lite' && isTransientError(streamErr)) {
+            throw streamErr;
+          }
+          throw streamErr;
         }
-        for (const src of extractGroundingSources(chunk)) {
-          if (!collectedSources.has(src.url)) {
-            collectedSources.set(src.url, src);
+
+        return { collectedSources, finalUsage, activeModel };
+      };
+
+      let streamOutcome;
+      try {
+        try {
+          streamOutcome = await runChatStream(requestedModel);
+        } catch (primaryErr) {
+          if (requestedModel !== 'gemini-3.1-flash-lite' && isTransientError(primaryErr) && !closed) {
+            streamOutcome = await runChatStream('gemini-3.1-flash-lite');
+          } else {
+            throw primaryErr;
           }
         }
-        const chunkUsage = extractUsage(chunk);
-        if (chunkUsage) {
-          finalUsage = chunkUsage;
-        }
-      }
 
-      if (!closed) {
-        writeSseEvent(res, 'done', {
-          sources: Array.from(collectedSources.values()),
-          usage: finalUsage,
-          model,
-        });
-        res.end();
+        if (!closed) {
+          writeSseEvent(res, 'done', {
+            sources: Array.from(streamOutcome.collectedSources.values()),
+            usage: streamOutcome.finalUsage,
+            model: streamOutcome.activeModel,
+          });
+          res.end();
+        }
+      } finally {
+        clearInterval(keepAliveTimer);
       }
     } catch (err) {
       const formatted = formatErrorResponse(err);
+      const message =
+        cfg.webSearch && formatted.status === 429
+          ? 'Google Search grounding quota reached on the active API key. Disable Web Search to retry directly, or check your Gemini API quota in Settings > Secrets.'
+          : formatted.message;
       if (res.headersSent) {
-        writeSseEvent(res, 'error', { message: formatted.message });
-        res.end();
+        if (!res.writableEnded) {
+          writeSseEvent(res, 'error', { message });
+          res.end();
+        }
       } else {
-        res.status(formatted.status).json({ error: formatted.message });
+        res.status(formatted.status).json({ error: message });
       }
     }
   });
@@ -424,11 +524,19 @@ async function startServer(): Promise<void> {
     res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
     res.setHeader('Cache-Control', 'no-cache, no-transform');
     res.setHeader('Connection', 'keep-alive');
+    res.setHeader('X-Accel-Buffering', 'no');
     res.flushHeaders();
+    res.write(': stream-open\n\n');
 
     let closed = false;
+    const researchKeepAlive = setInterval(() => {
+      if (!closed && !res.writableEnded) {
+        res.write(': keep-alive\n\n');
+      }
+    }, 4000);
     res.on('close', () => {
       closed = true;
+      clearInterval(researchKeepAlive);
     });
 
     try {
@@ -442,25 +550,29 @@ async function startServer(): Promise<void> {
       });
 
       const subQueryCount = depth === 'exhaustive' ? 4 : 2;
-      const planResp = await withRetry(() =>
-        ai.models.generateContent({
-          model: 'gemini-4-hydrogen',
-          contents: `Break down the following research topic into ${subQueryCount} concise, distinct web search queries to gather factual, primary-source evidence:\n\nTopic: "${query}"`,
-          config: {
-            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-            responseMimeType: 'application/json',
-            responseSchema: {
-              type: Type.OBJECT,
-              properties: {
-                subQueries: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                  description: 'Concise search queries for web grounding',
+      const { result: planResp, modelUsed: researchModel } = await withModelFailover(
+        'gemini-4-hydrogen',
+        (activeModel) =>
+          ai.models.generateContent({
+            model: activeModel,
+            contents: `Break down the following research topic into ${subQueryCount} concise, distinct web search queries to gather factual, primary-source evidence:\n\nTopic: "${query}"`,
+            config: {
+              ...(activeModel === 'gemini-4-hydrogen'
+                ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                : {}),
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  subQueries: {
+                    type: Type.ARRAY,
+                    items: { type: Type.STRING },
+                    description: 'Concise search queries for web grounding',
+                  },
                 },
               },
             },
-          },
-        })
+          })
       );
 
       let subQueries: string[] = [query];
@@ -490,19 +602,44 @@ async function startServer(): Promise<void> {
 
       const sourceMap = new Map<string, ExtractedSource>();
       const findingsPerQuery: Array<{ subQuery: string; summary: string }> = [];
+      let groundingQuotaLimited = false;
 
       for (const sq of subQueries) {
         if (closed) return;
-        const searchResp = await withRetry(() =>
-          ai.models.generateContent({
-            model: 'gemini-4-hydrogen',
-            contents: `Research and summarize key verified facts, dates, metrics, and primary evidence for: ${sq}`,
-            config: {
-              thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-              tools: [{ googleSearch: {} }],
-            },
-          })
-        );
+        let searchResp;
+        try {
+          const groundedOutcome = await withModelFailover(researchModel, (activeModel) =>
+            ai.models.generateContent({
+              model: activeModel,
+              contents: `Research and summarize key verified facts, dates, metrics, and primary evidence for: ${sq}`,
+              config: {
+                ...(activeModel === 'gemini-4-hydrogen'
+                  ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                  : {}),
+                tools: [{ googleSearch: {} }],
+              },
+            })
+          );
+          searchResp = groundedOutcome.result;
+        } catch (searchErr) {
+          const formattedSearch = formatErrorResponse(searchErr);
+          if (formattedSearch.status === 429 || formattedSearch.status === 403) {
+            groundingQuotaLimited = true;
+            const ungroundedOutcome = await withModelFailover(researchModel, (activeModel) =>
+              ai.models.generateContent({
+                model: activeModel,
+                contents: `Provide a thorough, factual intelligence brief summarizing established facts, key dates, and technical evidence for: ${sq}. Note clearly if live web verification is unavailable.`,
+                config:
+                  activeModel === 'gemini-4-hydrogen'
+                    ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+                    : {},
+              })
+            );
+            searchResp = ungroundedOutcome.result;
+          } else {
+            throw searchErr;
+          }
+        }
 
         const foundSources = extractGroundingSources(searchResp);
         for (const src of foundSources) {
@@ -526,7 +663,9 @@ async function startServer(): Promise<void> {
       writeSseEvent(res, 'stage', {
         id: 'collecting',
         status: 'done',
-        detail: `Collected ${collectedSources.length} grounded web sources`,
+        detail: groundingQuotaLimited
+          ? 'Google Search quota reached — compiled model-knowledge brief (0 external links)'
+          : `Collected ${collectedSources.length} grounded web sources`,
       });
 
       // Stage 3: Cross-Reference Analysis
@@ -544,11 +683,17 @@ async function startServer(): Promise<void> {
         .map((f, i) => `### Vector ${i + 1}: ${f.subQuery}\n${f.summary}`)
         .join('\n\n');
 
-      const analysisNotes = [
-        `Evaluated ${findingsPerQuery.length} search vectors with live Google Search grounding.`,
-        `Cataloged ${collectedSources.length} unique external citations for verification.`,
-        'Ready for structured intelligence report synthesis.',
-      ];
+      const analysisNotes = groundingQuotaLimited
+        ? [
+            `Evaluated ${findingsPerQuery.length} research vectors using Hawkins Lab model synthesis.`,
+            'Notice: Google Search grounding quota was reached on the active API key; live external URLs are unavailable.',
+            'Dossier explicitly marks empirical limitations under Verification & Limitations.',
+          ]
+        : [
+            `Evaluated ${findingsPerQuery.length} search vectors with live Google Search grounding.`,
+            `Cataloged ${collectedSources.length} unique external citations for verification.`,
+            'Ready for structured intelligence report synthesis.',
+          ];
       writeSseEvent(res, 'analysis', { notes: analysisNotes });
       writeSseEvent(res, 'stage', {
         id: 'analyzing',
@@ -563,46 +708,74 @@ async function startServer(): Promise<void> {
         detail: 'Generating classified Hawkins Lab dossier...',
       });
 
+      const citationRule =
+        collectedSources.length > 0
+          ? 'Use ONLY the gathered findings and cite sources inline using numbered brackets like [1], [2] matching the numbered Verified Sources list below.'
+          : 'Live web citations were unavailable on the active API quota for this sweep. Do NOT invent numbered brackets like [1] or fabricated URLs; clearly note empirical limitations under Verification & Limitations.';
+
       const synthesisPrompt = `You are the Lead Intelligence Analyst at Hawkins National Laboratory.
 Write a clear, authoritative, deeply structured Markdown research report answering:
 "${query}"
 
-Use ONLY the gathered findings and cite sources inline using numbered brackets like [1], [2] matching the numbered Verified Sources list below.
+${citationRule}
 
 ## Verified Sources Index
-${sourceIndexText || 'No external URLs returned; rely strictly on verified facts from the research pass.'}
+${sourceIndexText || 'No external URLs returned; rely strictly on verified facts from the research pass without bracketed citations.'}
 
 ## Gathered Findings
 ${findingsText}
 
 Requirements:
 - Start with an **Executive Summary** section.
-- Include **Key Findings**, **Detailed Analysis**, **Data & Evidence Comparison** (Markdown table if relevant), and **Verification & Limitations**.
-- Cite sources inline as [1], [2], etc. accurately.`;
+- Include **Key Findings**, **Detailed Analysis**, **Data & Evidence Comparison** (Markdown table if relevant), and **Verification & Limitations**.`;
 
-      const reportStream = await ai.models.generateContentStream({
-        model: 'gemini-4-hydrogen',
-        contents: synthesisPrompt,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM },
-        },
-      });
+      const runReportStream = async (activeModel: AllowedModel) => {
+        const reportStream = await ai.models.generateContentStream({
+          model: activeModel,
+          contents: synthesisPrompt,
+          config:
+            activeModel === 'gemini-4-hydrogen'
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.MEDIUM } }
+              : {},
+        });
+
+        let usageOut: {
+          promptTokens: number;
+          completionTokens: number;
+          totalTokens: number;
+        } | null = null;
+        let emittedDelta = false;
+
+        for await (const chunk of reportStream) {
+          if (closed) break;
+          const delta = chunk.text ?? '';
+          if (delta) {
+            emittedDelta = true;
+            writeSseEvent(res, 'report_delta', { text: delta });
+          }
+          const chunkUsage = extractUsage(chunk);
+          if (chunkUsage) {
+            usageOut = chunkUsage;
+          }
+        }
+        if (!emittedDelta && !closed) {
+          throw new Error('503 UNAVAILABLE empty synthesis stream');
+        }
+        return usageOut;
+      };
 
       let finalUsage: {
         promptTokens: number;
         completionTokens: number;
         totalTokens: number;
       } | null = null;
-
-      for await (const chunk of reportStream) {
-        if (closed) break;
-        const delta = chunk.text ?? '';
-        if (delta) {
-          writeSseEvent(res, 'report_delta', { text: delta });
-        }
-        const chunkUsage = extractUsage(chunk);
-        if (chunkUsage) {
-          finalUsage = chunkUsage;
+      try {
+        finalUsage = await runReportStream(researchModel);
+      } catch (reportErr) {
+        if (researchModel !== 'gemini-3.1-flash-lite' && isTransientError(reportErr) && !closed) {
+          finalUsage = await runReportStream('gemini-3.1-flash-lite');
+        } else {
+          throw reportErr;
         }
       }
 
@@ -620,8 +793,12 @@ Requirements:
       }
     } catch (err) {
       const formatted = formatErrorResponse(err);
-      writeSseEvent(res, 'error', { message: formatted.message });
-      res.end();
+      if (!res.writableEnded) {
+        writeSseEvent(res, 'error', { message: formatted.message });
+        res.end();
+      }
+    } finally {
+      clearInterval(researchKeepAlive);
     }
   });
 
@@ -651,9 +828,10 @@ Requirements:
 
     try {
       const ai = createAiClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-4-hydrogen',
-        contents: `Design a richly layered, atmospheric, high-contrast vector SVG artwork for the following visual prompt.
+      const generateSvgAttempt = async (activeModel: AllowedModel) => {
+        const resp = await ai.models.generateContent({
+          model: activeModel,
+          contents: `Design a richly layered, atmospheric, high-contrast vector SVG artwork for the following visual prompt.
 Prompt: "${prompt}"
 Style Direction: "${style}"
 Required viewBox: "${viewBox}"
@@ -662,41 +840,70 @@ Visual guidelines:
 - Use rich SVG gradients (<linearGradient>, <radialGradient>), layered silhouettes, geometric lighting, atmospheric particles/glows (<filter> with feGaussianBlur), and crisp composition fitting the exact viewBox "${viewBox}".
 - Palette inspiration: deep black (#080808), dark burgundy (#240A0D), blood red (#E50914), warm incandescent amber, and cold slate blue accents.
 - Output valid standalone <svg xmlns="http://www.w3.org/2000/svg" viewBox="${viewBox}">...</svg> markup with NO <script> tags and NO external image URLs.`,
-        config: {
-          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              title: { type: Type.STRING, description: 'Short evocative artwork title' },
-              description: { type: Type.STRING, description: 'One-sentence visual description' },
-              palette: {
-                type: Type.ARRAY,
-                items: { type: Type.STRING },
-                description: '3 to 5 hex color codes used in the artwork',
-              },
-              svgMarkup: {
-                type: Type.STRING,
-                description: 'Complete valid <svg>...</svg> markup matching the requested viewBox',
+          config: {
+            ...(activeModel === 'gemini-4-hydrogen'
+              ? { thinkingConfig: { thinkingLevel: ThinkingLevel.LOW } }
+              : {}),
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              required: ['title', 'description', 'svgMarkup'],
+              properties: {
+                title: { type: Type.STRING, description: 'Short evocative artwork title' },
+                description: { type: Type.STRING, description: 'One-sentence visual description' },
+                palette: {
+                  type: Type.ARRAY,
+                  items: { type: Type.STRING },
+                  description: '3 to 5 hex color codes used in the artwork',
+                },
+                svgMarkup: {
+                  type: Type.STRING,
+                  description: 'Complete valid <svg>...</svg> markup matching the requested viewBox',
+                },
               },
             },
           },
-        },
-      });
+        });
 
-      const parsed = JSON.parse((response.text ?? '{}').trim()) as {
-        title?: string;
-        description?: string;
-        palette?: string[];
-        svgMarkup?: string;
+        const rawText = (resp.text ?? '').trim();
+        let parsed: {
+          title?: string;
+          description?: string;
+          palette?: string[];
+          svgMarkup?: string;
+        } = {};
+        try {
+          const stripped = rawText.replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/i, '').trim();
+          parsed = JSON.parse(stripped) as typeof parsed;
+        } catch {
+          const svgMatch = rawText.match(/<svg[\s\S]*?<\/svg>/i);
+          if (svgMatch) {
+            parsed = { svgMarkup: svgMatch[0] };
+          }
+        }
+
+        let cleanSvg = sanitizeSvgServer(parsed.svgMarkup ?? '');
+        if (!cleanSvg) {
+          const fallbackMatch = rawText.match(/<svg[\s\S]*?<\/svg>/i);
+          if (fallbackMatch) {
+            cleanSvg = sanitizeSvgServer(fallbackMatch[0]);
+          }
+        }
+        return { resp, parsed, cleanSvg };
       };
 
-      const cleanSvg = sanitizeSvgServer(parsed.svgMarkup ?? '');
-      if (!cleanSvg) {
+      let outcome = await withModelFailover('gemini-4-hydrogen', (m) => generateSvgAttempt(m));
+      if (!outcome.result.cleanSvg) {
+        const retryResult = await withRetry(() => generateSvgAttempt('gemini-3.1-flash-lite'), 1);
+        outcome = { result: retryResult, modelUsed: 'gemini-3.1-flash-lite' };
+      }
+
+      if (!outcome.result.cleanSvg) {
         res.status(502).json({ error: 'Model did not return valid SVG artwork.' });
         return;
       }
 
+      const { resp: response, parsed, cleanSvg } = outcome.result;
       res.json({
         title: parsed.title || 'Hawkins Visual Synthesis',
         description: parsed.description || prompt,
@@ -761,31 +968,33 @@ Visual guidelines:
     const voiceName = body?.voiceName && allowedVoices.has(body.voiceName) ? body.voiceName : 'Charon';
 
     try {
-      const ai = createAiClient();
-      const response = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: clipped,
-                speechMetadata: {
-                  style: 'Calm, crisp, authoritative 1980s laboratory narrator',
+      const ai = createAiClient('v1beta');
+      const response = await withRetry(() =>
+        ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: clipped,
+                  speechMetadata: {
+                    style: 'Calm, crisp, authoritative 1980s laboratory narrator',
+                  },
                 },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName },
               },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName },
             },
           },
-        },
-      });
+        })
+      );
 
       const audioBase64 = response.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
       if (!audioBase64) {
@@ -803,6 +1012,10 @@ Visual guidelines:
     }
   });
 
+  app.all('/api/*', (_req: Request, res: Response) => {
+    res.status(404).json({ error: 'Unknown Hawkins API endpoint.' });
+  });
+
   if (!IS_PROD) {
     const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
@@ -811,15 +1024,16 @@ Visual guidelines:
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.resolve(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(express.static(DIST_DIR));
     app.get('*', (_req: Request, res: Response) => {
-      res.sendFile(path.join(distPath, 'index.html'));
+      res.sendFile(DIST_INDEX);
     });
   }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`STRANGER THINGS AI server listening on http://0.0.0.0:${PORT}`);
+    console.log(
+      `STRANGER THINGS AI server (${IS_PROD ? 'production' : 'development'}) listening on http://0.0.0.0:${PORT}`
+    );
   });
 }
 

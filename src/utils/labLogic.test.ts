@@ -5,8 +5,11 @@ import {
   computeEffectiveAmbientGain,
   createConversationTitle,
   createInitialResearchStages,
+  DEFAULT_LAB_SETTINGS,
   estimateTokenCount,
   getActiveAlphabetIndices,
+  getNostalgiaArpPattern,
+  getSynthFrequencyForLetter,
   isSamplingSupported,
   parseSseLine,
   sanitizeLabSettings,
@@ -27,6 +30,7 @@ test('sanitizeLabSettings clamps out-of-range tokens, sampling, and ambient volu
     topK: 200,
     ambientVolume: 5,
     ambientSoundMuted: true,
+    dimensionMode: 'upside-down',
   });
 
   assert.equal(sanitized.maxOutputTokens, 32768);
@@ -35,12 +39,32 @@ test('sanitizeLabSettings clamps out-of-range tokens, sampling, and ambient volu
   assert.equal(sanitized.topK, 64);
   assert.equal(sanitized.ambientVolume, 1);
   assert.equal(sanitized.ambientSoundMuted, true);
+  assert.equal(sanitized.dimensionMode, 'upside-down');
 });
 
 test('computeEffectiveAmbientGain returns 0 when muted and scales gently when unmuted', () => {
   assert.equal(computeEffectiveAmbientGain(true, 0.8), 0);
   assert.equal(computeEffectiveAmbientGain(false, 0.5), 0.16);
   assert.equal(computeEffectiveAmbientGain(false, 2), 0.32);
+});
+
+test('getSynthFrequencyForLetter returns positive Hz frequencies across 0-25 indices', () => {
+  for (let i = 0; i < 26; i += 1) {
+    const hz = getSynthFrequencyForLetter(i);
+    assert.ok(hz > 100 && hz < 1000);
+  }
+});
+
+test('getNostalgiaArpPattern generates Cmaj7 1980s ostinato and respects nostalgiaSynthEnabled default', () => {
+  assert.equal(DEFAULT_LAB_SETTINGS.nostalgiaSynthEnabled, true);
+  const pattern = getNostalgiaArpPattern(2);
+  assert.equal(pattern.length, 16);
+  assert.deepEqual(
+    pattern.slice(0, 8).map((s) => s.letter),
+    ['C', 'E', 'G', 'B', 'C', 'B', 'G', 'E']
+  );
+  assert.equal(pattern[0].delayMs, 0);
+  assert.ok(pattern[15].delayMs > pattern[0].delayMs);
 });
 
 test('estimateTokenCount and accumulateTokenUsage track usage accurately', () => {
