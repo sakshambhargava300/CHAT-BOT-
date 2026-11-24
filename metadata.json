@@ -1,0 +1,6 @@
+{
+  "name": "STRANGER THINGS AI",
+  "description": "An immersive 1980s Hawkins Laboratory and Upside Down AI terminal featuring streaming chat, Deep Research with Google Search grounding, document analysis, visual synthesis, and voice controls.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

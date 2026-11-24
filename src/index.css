@@ -1,0 +1,190 @@
+@import "tailwindcss";
+@custom-variant dark (&:where(.dark, .dark *));
+
+@layer base {
+  :root {
+    --hawkins-black: #080808;
+    --hawkins-burgundy: #240a0d;
+    --hawkins-red: #e50914;
+    --hawkins-cold-blue: #60a5fa;
+  }
+
+  html,
+  body {
+    background-color: #080808;
+    color: #ede9e8;
+    font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+  }
+}
+
+.font-hawkins-display {
+  font-family: 'Libre Baskerville', Georgia, serif;
+}
+
+.font-hawkins-sans {
+  font-family: 'IBM Plex Sans', system-ui, -apple-system, sans-serif;
+}
+
+.font-hawkins-mono {
+  font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Iconic glowing horror serif treatment inspired by 1980s title cards */
+.st-title-glow {
+  color: #0e0405;
+  -webkit-text-stroke: 1.5px #e50914;
+  text-shadow:
+    0 0 14px rgba(229, 9, 20, 0.72),
+    0 0 36px rgba(229, 9, 20, 0.42),
+    0 0 70px rgba(139, 0, 12, 0.35);
+}
+
+.st-title-glow-subtle {
+  color: #f6e7e8;
+  text-shadow:
+    0 0 12px rgba(229, 9, 20, 0.55),
+    0 0 28px rgba(229, 9, 20, 0.25);
+}
+
+.st-rule-bar {
+  height: 2px;
+  background: linear-gradient(90deg, rgba(229, 9, 20, 0.15) 0%, #e50914 50%, rgba(229, 9, 20, 0.15) 100%);
+  box-shadow: 0 0 12px rgba(229, 9, 20, 0.65);
+}
+
+/* Slow-moving Upside Down fog (compositor-only) */
+@keyframes hawkins-fog-drift {
+  0% {
+    transform: translate3d(-4%, 0, 0) scale(1.04);
+    opacity: 0.32;
+  }
+  50% {
+    transform: translate3d(4%, -2%, 0) scale(1.08);
+    opacity: 0.48;
+  }
+  100% {
+    transform: translate3d(-4%, 0, 0) scale(1.04);
+    opacity: 0.32;
+  }
+}
+
+@keyframes hawkins-lightning-pulse {
+  0%, 88%, 94%, 100% {
+    opacity: 0;
+  }
+  89% {
+    opacity: 0.36;
+  }
+  90% {
+    opacity: 0.08;
+  }
+  91.5% {
+    opacity: 0.52;
+  }
+  93% {
+    opacity: 0.05;
+  }
+}
+
+@keyframes hawkins-bulb-flicker {
+  0%, 100% {
+    opacity: 0.92;
+    transform: scale(1);
+  }
+  42% {
+    opacity: 0.75;
+  }
+  45% {
+    opacity: 0.28;
+  }
+  47% {
+    opacity: 1;
+    transform: scale(1.06);
+  }
+  78% {
+    opacity: 0.88;
+  }
+}
+
+@keyframes hawkins-subtle-glitch {
+  0%, 96%, 100% {
+    transform: translate3d(0, 0, 0);
+    opacity: 1;
+  }
+  97% {
+    transform: translate3d(-1.5px, 0, 0);
+    opacity: 0.92;
+  }
+  98% {
+    transform: translate3d(1.5px, 0, 0);
+    opacity: 0.96;
+  }
+}
+
+.animate-hawkins-fog {
+  animation: hawkins-fog-drift 28s ease-in-out infinite;
+  will-change: transform, opacity;
+}
+
+.animate-hawkins-lightning {
+  animation: hawkins-lightning-pulse 14s ease-in-out infinite;
+  will-change: opacity;
+}
+
+.animate-hawkins-bulb {
+  animation: hawkins-bulb-flicker 5.5s ease-in-out infinite;
+  will-change: opacity, transform;
+}
+
+.animate-hawkins-glitch {
+  animation: hawkins-subtle-glitch 16s steps(1, end) infinite;
+  will-change: transform, opacity;
+}
+
+/* Reduced motion honors both OS preference and explicit app toggle */
+@media (prefers-reduced-motion: reduce) {
+  .animate-hawkins-fog,
+  .animate-hawkins-lightning,
+  .animate-hawkins-bulb,
+  .animate-hawkins-glitch {
+    animation: none !important;
+  }
+}
+
+[data-reduced-motion="true"] .animate-hawkins-fog,
+[data-reduced-motion="true"] .animate-hawkins-lightning,
+[data-reduced-motion="true"] .animate-hawkins-bulb,
+[data-reduced-motion="true"] .animate-hawkins-glitch {
+  animation: none !important;
+}
+
+/* Subtle CRT scanline overlay */
+.crt-scanlines {
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(255, 255, 255, 0) 0px,
+    rgba(255, 255, 255, 0) 2px,
+    rgba(0, 0, 0, 0.16) 3px,
+    rgba(0, 0, 0, 0.16) 4px
+  );
+}
+
+/* Custom dark scrollbar */
+::-webkit-scrollbar {
+  width: 7px;
+  height: 7px;
+}
+
+::-webkit-scrollbar-track {
+  background: #0a0a0c;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #2b181b;
+  border-radius: 4px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #611820;
+}
